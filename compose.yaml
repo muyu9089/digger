@@ -1,0 +1,21 @@
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - investment-data:/app/data
+    environment:
+      INVEST_SECURE_COOKIE: "1"
+      INVEST_MODEL_KEY: ${INVEST_MODEL_KEY:-}
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "app.py", "--worker"]
+    volumes:
+      - investment-data:/app/data
+    environment:
+      INVEST_MODEL_KEY: ${INVEST_MODEL_KEY:-}
+volumes:
+  investment-data:
