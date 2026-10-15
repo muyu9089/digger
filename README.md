@@ -31,6 +31,14 @@ python app.py --worker
 8. 亏损基准需要确认日终日期、完整人民币总资产。基准日之后的外部投入调整亏损，内部转账不调整。外币外部资金流必须提供当日折算汇率。历史数据缺失或过期时不触发正式亏损告警。
 9. 报告保存生成时持仓、证券理由、来源、模型配置摘要和消耗。采纳/暂缓/不采纳只保存决策，不生成交易。已入账记录修正保留原值，按日期重算后续；旧研究快照不被改写。
 
+## TuShare Pro A 股日终数据
+
+在 web 和 worker 的服务端环境设置 `TUSHARE_TOKEN`，不要写入页面、数据库或备份。Docker Compose 可通过部署机环境变量传入。设置页可测试 Token 与 `stock_basic`、`trade_cal`、`daily`、`daily_basic` 四项权限，或手动同步已持仓 A 股。worker 在上海时间每天 18:00 后尝试同步一次；接口当日尚未更新时可稍后手动重试。`daily_basic` 需要相应积分权限。首次读取近期 35 天，后续从已存最后交易日增量拉取。
+
+仅同步人民币 A 股股票（证券类型 `stock`，市场为 `CN`、`SH/SSE`、`SZ/SZSE`、`BJ/BSE`，或代码含 `.SH/.SZ/.BJ`）；ETF、基金、可转债及外币证券继续手工维护。宽泛的 `CN` 市场代码必须能在交易所列表中唯一匹配，否则同步报错，需先核对证券身份。价格、基本信息、交易日及每日估值指标保存来源和同步时间；停牌没有日线时保留上次有效价格，并在估值中显示过期提醒。同步失败不改交易、数量、成本或已有价格；手工价格可继续维护，同日手工价优先。研究快照包含已校验数据，行情指标不能替代公告或新闻证据。
+
+TuShare 接口定义：[股票列表](https://tushare.pro/document/1?doc_id=25)、[日线行情](https://tushare.pro/document/2?doc_id=27)、[每日指标](https://tushare.pro/document/2?doc_id=32)、[交易日历](https://tushare.pro/document/2?doc_id=26)。
+
 ## 模型与资料配置
 
 密钥只从服务端环境变量 `INVEST_MODEL_KEY` 读取。不会返回浏览器、进入普通日志或写入备份。页面设置模型完整 HTTPS 接口地址、模型名、计费单价和预算；必须勾选数据发送授权。当前协议为 Chat Completions：POST `{model,messages,max_tokens}`，响应 `{choices:[{message:{content},finish_reason}],usage:{prompt_tokens,completion_tokens}}`。不依赖特定模型厂商。

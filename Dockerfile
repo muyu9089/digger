@@ -1,6 +1,7 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY app.py ./
+COPY market_data.py ./
 COPY static ./static
 RUN useradd --create-home workbench && mkdir /app/data && chown workbench:workbench /app/data
 USER workbench

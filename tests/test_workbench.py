@@ -210,6 +210,61 @@ class Acceptance(unittest.TestCase):
         self.assertTrue(self.summary()['stale'])
         with self.assertRaises(ValueError): self.s.save_object('price', dict(id='stock', value='1', date='2019-01-01', source='old'))
 
+    def test_tushare_sync_updates_value_without_changing_ledger(self):
+        self.s.save_object('security', dict(id='cn-share', name='旧名称', code='000001', market='CN', type='stock', currency='CNY', unit='股', multiplier='1'))
+        self.init(positions=[dict(account='a', security='cn-share', quantity='10', cost='80')])
+        moment = app.dt.datetime.now(app.TZ)
+        day = (moment.date() if moment.hour >= 18 else moment.date() - app.dt.timedelta(days=1)).strftime('%Y%m%d')
+        before = self.s.state()['entries']
+
+        def query(api, params, fields):
+            if api == 'trade_cal':
+                return [dict(cal_date=day, is_open=1)]
+            if api == 'stock_basic':
+                return [dict(ts_code='000001.SZ', symbol='000001', name='平安银行', exchange='SZSE', list_status='L', list_date='19910403')] if params['exchange'] == 'SZSE' and params['list_status'] == 'L' else []
+            if api == 'daily':
+                return [dict(ts_code='000001.SZ', trade_date=day, close=12)]
+            if api == 'daily_basic':
+                return [dict(ts_code='000001.SZ', trade_date=day, close=12, pe=5, pb=1, total_mv=100)]
+            self.fail(api)
+
+        with patch.dict('os.environ', {'TUSHARE_TOKEN': 'secret'}), patch('market_data.TuShare.query', side_effect=query):
+            self.assertEqual(self.s.sync_market()['updated'], 1)
+        state = self.s.state()
+        h = next(h for h in state['summary']['holdings'] if h['security'] == 'cn-share')
+        self.assertEqual(D(h['value']), 120)
+        self.assertEqual(D(h['unrealized']), 40)
+        self.assertEqual(h['market_data']['source'], 'TuShare Pro')
+        self.assertEqual(state['entries'], before)
+        backup = self.s.backup()
+        restored = app.Store(Path(self.tmp.name) / 'tushare-restored.sqlite')
+        restored.restore(backup)
+        self.assertEqual(restored.state()['summary']['holdings'], state['summary']['holdings'])
+
+        with patch.dict('os.environ', {'TUSHARE_TOKEN': 'secret'}), patch('market_data.TuShare.query', side_effect=lambda api, params, fields: [] if api in {'daily', 'daily_basic'} else query(api, params, fields)):
+            self.assertEqual(self.s.sync_market()['updated'], 0)
+        self.assertEqual(next(x for x in self.s.state()['summary']['holdings'] if x['security'] == 'cn-share')['value'], h['value'])
+
+        with self.s.connect() as db:
+            db.execute("DELETE FROM objects WHERE kind='market_daily'")
+        with patch.dict('os.environ', {'TUSHARE_TOKEN': 'secret'}), patch('market_data.TuShare.query', side_effect=lambda api, params, fields: [] if api == 'daily_basic' else query(api, params, fields)):
+            with self.assertRaisesRegex(ValueError, '每日估值指标缺少'):
+                self.s.sync_market()
+        self.assertEqual(next(h for h in self.s.state()['summary']['holdings'] if h['security'] == 'cn-share')['value'], h['value'])
+        self.assertEqual(self.s.state()['entries'], before)
+        with patch.dict('os.environ', {'TUSHARE_TOKEN': 'secret'}), patch('market_data.TuShare.query', side_effect=ValueError('TuShare 权限不足或 Token 无效')):
+            with self.assertRaisesRegex(ValueError, '权限不足'):
+                self.s.sync_market()
+        self.assertFalse(self.s.state()['market_sync']['ok'])
+        self.assertEqual(next(x for x in self.s.state()['summary']['holdings'] if x['security'] == 'cn-share')['value'], h['value'])
+
+    def test_tushare_identity_rejects_ambiguous_cn_code(self):
+        from market_data import identity
+        rows = [dict(symbol='000001', ts_code='000001.SZ', name='甲', exchange='SZSE', list_status='L'), dict(symbol='000001', ts_code='000001.SH', name='乙', exchange='SSE', list_status='L')]
+        with self.assertRaisesRegex(ValueError, '无法唯一映射'):
+            identity(dict(code='000001', market='CN'), rows)
+        self.assertEqual(identity(dict(code='000001', market='SZ'), rows)['ts_code'], '000001.SZ')
+
     def test_cumulative_plans_and_separate_scenarios(self):
         self.init('100000')
         self.s.save_object('account', dict(id='a', name='a', currency='CNY', withdrawable='100000', liquidity_verified=True, liquidity_date=app.now()[:10], liquidity_source='manual'))

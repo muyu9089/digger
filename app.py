@@ -21,6 +21,7 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.etree import ElementTree as ET
+from market_data import TuShare, finite, identity, iso, positive
 
 ROOT = Path(__file__).parent
 TZ = dt.timezone(dt.timedelta(hours=8))
@@ -280,6 +281,92 @@ class Store:
     def put(self, db, kind, data):
         db.execute('INSERT OR REPLACE INTO objects VALUES(?,?,?)', (kind, data['id'], encoded(wire(data))))
 
+    def sync_market(self, provider=None):
+        provider = provider or TuShare()
+        with self.connect() as db:
+            held = {h['security'] for h in self.summary(db)['holdings']}
+            securities = [s for s in self.objects(db, 'security').values() if s['id'] in held and s['type'] == 'stock' and s['currency'] == 'CNY']
+            history = self.objects(db, 'market_daily')
+        if not securities:
+            return {'ok': True, 'message': '暂无已持仓 A 股股票', 'updated': 0}
+        cutoff = dt.datetime.now(TZ)
+        end = cutoff.date() if cutoff.hour >= 18 else cutoff.date() - dt.timedelta(days=1)
+        # shortcut: first sync backfills 35 days; extend when full price history is required.
+        start = end - dt.timedelta(days=35)
+        prior_days = [v['date'] for v in history.values() if v['security'] in {s['id'] for s in securities}]
+        if prior_days:
+            start = min(start, dt.date.fromisoformat(min(prior_days)) + dt.timedelta(days=1))
+        try:
+            calendar = provider.query('trade_cal', {'exchange': 'SSE', 'start_date': start.strftime('%Y%m%d'), 'end_date': end.strftime('%Y%m%d')}, ['cal_date', 'is_open'])
+            days = {iso(r['cal_date']): str(r['is_open']) for r in calendar}
+            if end.isoformat() not in days or any(v not in {'0', '1'} for v in days.values()):
+                raise ValueError('TuShare 交易日历不完整')
+            latest = max((day for day, opened in days.items() if opened == '1'), default=None)
+            if not latest:
+                raise ValueError('未取得近期交易日')
+            # Query exchange lists to resolve legacy CN codes without guessing by name or prefix.
+            listings = []
+            for exchange in ('SSE', 'SZSE', 'BSE'):
+                for status in ('L', 'D'):
+                    listings.extend(provider.query('stock_basic', {'exchange': exchange, 'list_status': status}, ['ts_code', 'symbol', 'name', 'exchange', 'list_status', 'list_date']))
+            staged, basics = [], []
+            for security in securities:
+                row = identity(security, listings)
+                if not row:
+                    continue
+                ts_code = row['ts_code']
+                basics.append({'id': security['id'], 'ts_code': ts_code, 'name': row['name'], 'exchange': row['exchange'], 'list_status': row['list_status'], 'list_date': iso(row['list_date']) if row.get('list_date') else None, 'source': provider.source, 'synced_at': now()})
+                prior = [v['date'] for v in history.values() if v['security'] == security['id']]
+                first = (dt.date.fromisoformat(max(prior)) + dt.timedelta(days=1)).isoformat() if prior else (end - dt.timedelta(days=35)).isoformat()
+                if first > latest:
+                    continue
+                params = {'ts_code': ts_code, 'start_date': first.replace('-', ''), 'end_date': latest.replace('-', '')}
+                prices = provider.query('daily', params, ['ts_code', 'trade_date', 'close'])
+                metrics = provider.query('daily_basic', params, ['ts_code', 'trade_date', 'close', 'pe', 'pb', 'total_mv'])
+                by_day = {}
+                for item in metrics:
+                    day = iso(item['trade_date'])
+                    if item['ts_code'] != ts_code or day in by_day:
+                        raise ValueError('每日估值指标的证券身份或日期异常')
+                    by_day[day] = item
+                for item in prices:
+                    day = iso(item['trade_date'])
+                    if item['ts_code'] != ts_code or days.get(day) != '1' or not first <= day <= latest or any(x['date'] == day and x['security'] == security['id'] for x in staged):
+                        raise ValueError('日线的证券身份或交易日期异常')
+                    close = positive(item['close'], '收盘价')
+                    metric = by_day.get(day)
+                    if not metric:
+                        raise ValueError('每日估值指标缺少 ' + ts_code + ' ' + day)
+                    if metric and Decimal(positive(metric['close'], '估值收盘价')) != Decimal(close):
+                        raise ValueError('日线与估值指标收盘价不一致')
+                    staged.append({'id': security['id'] + ':' + day, 'security': security['id'], 'ts_code': ts_code, 'date': day, 'close': close,
+                                   'pe': finite(metric.get('pe'), '市盈率'),
+                                   'pb': finite(metric.get('pb'), '市净率'),
+                                   'total_mv': positive(metric['total_mv'], '总市值') if metric.get('total_mv') is not None else None,
+                                   'source': provider.source, 'synced_at': now()})
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                current = self.objects(db, 'price')
+                for item in basics:
+                    self.put(db, 'market_security', item)
+                for item in sorted(staged, key=lambda x: x['date']):
+                    self.put(db, 'market_daily', item)
+                    old = current.get(item['security'])
+                    if old and (old['date'] > item['date'] or old['date'] == item['date'] and old.get('source') != provider.source):
+                        continue
+                    quote = {'id': item['security'], 'value': item['close'], 'date': item['date'], 'source': provider.source, 'synced_at': item['synced_at']}
+                    self.put(db, 'price', quote)
+                    current[item['security']] = quote
+                status = {'id': 'tushare', 'ok': True, 'at': now(), 'trade_date': latest, 'updated': len(staged), 'message': '同步完成；停牌或休市时保留上一有效收盘价'}
+                self.put(db, 'market_calendar', {'id': 'SSE', 'trade_date': latest, 'source': provider.source, 'synced_at': now()})
+                self.put(db, 'market_sync', status)
+            return status
+        except Exception as exc:
+            message = safe_error(exc)
+            with self.connect() as db:
+                self.put(db, 'market_sync', {'id': 'tushare', 'ok': False, 'at': now(), 'message': message})
+            raise ValueError(message) from None
+
     def audit(self, db, action, data):
         db.execute('INSERT INTO audit(at,action,body) VALUES(?,?,?)', (now(), action, encoded(wire(data))))
 
@@ -439,6 +526,8 @@ class Store:
     def summary(self, db, entries=None):
         accounts, securities = self.objects(db, 'account'), self.objects(db, 'security')
         prices, rates = self.objects(db, 'price'), self.objects(db, 'rate')
+        trade_day = self.objects(db, 'market_calendar').get('SSE', {}).get('trade_date')
+        market_daily = self.objects(db, 'market_daily')
         ledger = self.ledger(db, entries)
         missing, stale, holdings, balances, transit = [], [], [], [], []
         total, liquid, account_totals = Decimal(0), Decimal(0), {}
@@ -479,11 +568,12 @@ class Store:
             value = None if quote is None else p['quantity'] * number(quote['value']) * number(s['multiplier'])
             if quote is None:
                 missing.append(f'{s["name"]}缺少行情')
-            elif (today - dt.date.fromisoformat(quote['date'])).days > 3:
+            elif (trade_day and s['type'] == 'stock' and s['currency'] == 'CNY' and quote['date'] < trade_day) or (not trade_day and (today - dt.date.fromisoformat(quote['date'])).days > 3):
                 stale.append(f'{s["name"]}行情：{quote["date"]}')
             rmb = None if value is None else convert(value, s['currency'], s['name'])
             add_account(a, rmb)
-            holdings.append({'account': a, 'security': sid, **p, 'value': value, 'rmb': rmb, 'unrealized': None if p['cost'] is None or value is None else value - p['cost'], 'quote': quote})
+            metric = market_daily.get(sid + ':' + quote['date']) if quote else None
+            holdings.append({'account': a, 'security': sid, **p, 'value': value, 'rmb': rmb, 'unrealized': None if p['cost'] is None or value is None else value - p['cost'], 'quote': quote, 'market_data': metric})
         for request in ledger['pending'].values():
             if request['value']:
                 rmb = convert(request['value'], request['currency'], '在途/应收款')
@@ -674,6 +764,9 @@ class Store:
             result['entries'], result['effective_entries'] = self.entries(db)
             result['audit'] = [dict(r, body=json.loads(r['body'])) for r in db.execute('SELECT * FROM audit ORDER BY seq DESC LIMIT 100')]
             result['model_key_set'] = bool(os.environ.get('INVEST_MODEL_KEY'))
+            result['tushare_token_set'] = bool(os.environ.get('TUSHARE_TOKEN'))
+            result['market_sync'] = self.objects(db, 'market_sync').get('tushare')
+            result['market_security'] = list(self.objects(db, 'market_security').values())
             result['portfolio'] = self.portfolio(db)
             return wire(result)
 
@@ -773,7 +866,9 @@ class Store:
                 spent = sum((number(t.get('reserved', '0')) for t in tasks.values() if t['created_at'][:10] == today), Decimal(0))
                 if spent + estimate > number(config.get('daily_budget', '2')):
                     raise ValueError('当日预算不足（失败与取消任务保留预留预算，防止重复调用）')
-                data = dict(data, reserved=str(estimate), snapshot=summary, securities=list(self.objects(db, 'security').values()))
+                basics = self.objects(db, 'market_security')
+                securities = [dict(s, market_info=basics.get(s['id'])) for s in self.objects(db, 'security').values()]
+                data = dict(data, reserved=str(estimate), snapshot=summary, securities=securities)
             task = dict(data, id=event, type=kind, status='queued', created_at=now(), error=None)
             self.put(db, 'task', task)
             return task
@@ -1137,6 +1232,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = store.create_task(data)
             elif self.path == '/api/task/action':
                 result = store.task_action(data)
+            elif self.path == '/api/market/test':
+                result = TuShare().test()
+            elif self.path == '/api/market/sync':
+                result = store.sync_market()
             elif self.path == '/api/portfolio':
                 with store.connect() as db:
                     result = store.portfolio(db, data.get('shock', '0.2'))
@@ -1153,6 +1252,15 @@ class Handler(BaseHTTPRequestHandler):
 def worker(store, stop):
     while not stop.is_set():
         try:
+            moment = dt.datetime.now(TZ)
+            if moment.hour >= 18 and os.environ.get('TUSHARE_TOKEN'):
+                with store.connect() as db:
+                    last = store.objects(db, 'market_sync').get('tushare', {})
+                if last.get('at', '')[:10] != moment.date().isoformat():
+                    try:
+                        store.sync_market()
+                    except ValueError:
+                        pass
             store.tick_schedules()
             store.run_next()
         except Exception:
